@@ -34,7 +34,7 @@ jobs:
         with:
           repository: codag-megalith/codag-cli
           ref: v${{ inputs.version }}
-          ssh-key: ${{ secrets.CODAG_CLI_DEPLOY_KEY }}
+          token: ${{ secrets.CODAG_CLI_RELEASE_TOKEN }}
           persist-credentials: false
           path: source
 
