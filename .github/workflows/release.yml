@@ -1,42 +1,84 @@
 name: Publish CLI release
+run-name: Publish Codag v${{ inputs.version || github.event.client_payload.version }}
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Source tag version without the leading v
+        description: Stable source version without the leading v
         required: true
         type: string
+      source_sha:
+        description: Full commit SHA resolved by the private release workflow
+        required: true
+        type: string
+  repository_dispatch:
+    types: [publish-cli-release]
 
 permissions:
   contents: write
   id-token: write
   attestations: write
 
+concurrency:
+  group: cli-release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version || github.event.client_payload.version }}
+      SOURCE_SHA: ${{ inputs.source_sha || github.event.client_payload.source_sha }}
     steps:
       - name: Check out release repository
         uses: actions/checkout@v6
 
-      - name: Validate version
+      - name: Validate immutable release identity
         env:
-          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
-            echo "Invalid release version: $VERSION" >&2
+          set -euo pipefail
+          if ! printf '%s' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "Invalid stable release version: $VERSION" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Invalid full source SHA: $SOURCE_SHA" >&2
+            exit 1
+          fi
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Public release v$VERSION already exists and will not be overwritten." >&2
             exit 1
           fi
 
-      - name: Check out private source tag
+      - name: Mint private-source token
+        id: source-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CODAG_RELEASE_APP_ID }}
+          private-key: ${{ secrets.CODAG_RELEASE_APP_PRIVATE_KEY }}
+          owner: codag-megalith
+          repositories: codag-cli
+          permission-contents: read
+
+      - name: Check out exact private source tag
         uses: actions/checkout@v6
         with:
           repository: codag-megalith/codag-cli
-          ref: v${{ inputs.version }}
-          token: ${{ secrets.CODAG_CLI_RELEASE_TOKEN }}
+          ref: v${{ env.VERSION }}
+          token: ${{ steps.source-token.outputs.token }}
           persist-credentials: false
+          fetch-depth: 0
           path: source
+
+      - name: Verify private source identity
+        working-directory: source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-list -n 1 "v$VERSION")" = "$SOURCE_SHA"
+          test "$(git describe --tags --exact-match)" = "v$VERSION"
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -46,60 +88,60 @@ jobs:
 
       - name: Verify source
         working-directory: source
-        env:
-          VERSION: ${{ inputs.version }}
         run: |
-          test "$(git describe --tags --exact-match)" = "v$VERSION"
           go vet ./...
           go test ./...
 
-      - name: Build release archives
-        working-directory: source
+      - name: Build canonical release archives
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: v2.15.4
+          distribution: goreleaser
+          workdir: source
+          args: release --clean --skip=publish
         env:
-          VERSION: ${{ inputs.version }}
+          GITHUB_TOKEN: ${{ steps.source-token.outputs.token }}
+
+      - name: Assemble public release
         run: |
           set -euo pipefail
-          commit="$(git rev-parse --short HEAD)"
-          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          dist_dir="$GITHUB_WORKSPACE/dist"
-          build_dir="$GITHUB_WORKSPACE/build"
-          mkdir -p "$dist_dir" "$build_dir"
-          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
-            os="${target%/*}"
-            arch="${target#*/}"
-            target_dir="$build_dir/${os}_${arch}"
-            mkdir -p "$target_dir"
-            binary="codag"
-            if [ "$os" = windows ]; then binary="codag.exe"; fi
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
-              -ldflags "-s -w -X github.com/codag-megalith/codag-cli/cmd.Version=$VERSION -X github.com/codag-megalith/codag-cli/cmd.Commit=$commit -X github.com/codag-megalith/codag-cli/cmd.BuildDate=$build_date" \
-              -o "$target_dir/$binary" .
-            if [ "$os" = windows ]; then
-              (cd "$target_dir" && zip -q "$dist_dir/codag_${os}_${arch}.zip" "$binary")
-            else
-              tar -C "$target_dir" -czf "$dist_dir/codag_${os}_${arch}.tar.gz" "$binary"
-            fi
-          done
-          cp install.sh install.ps1 "$dist_dir/"
-          chmod +x "$dist_dir/install.sh"
-          (cd "$dist_dir" && sha256sum codag_* > checksums.txt)
+          mkdir -p dist
+          cp source/dist/codag_*.tar.gz source/dist/codag_*.zip dist/
+          cp install.sh install.ps1 dist/
+          chmod +x dist/install.sh
+          jq -n \
+            --arg version "$VERSION" \
+            --arg source_repository "codag-megalith/codag-cli" \
+            --arg source_tag "v$VERSION" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg release_repository "$GITHUB_REPOSITORY" \
+            --arg release_workflow_sha "$GITHUB_SHA" \
+            --arg workflow_run_id "$GITHUB_RUN_ID" \
+            '{schema_version:1,version:$version,source_repository:$source_repository,source_tag:$source_tag,source_sha:$source_sha,release_repository:$release_repository,release_workflow_sha:$release_workflow_sha,workflow_run_id:$workflow_run_id}' \
+            > dist/provenance.json
+          (cd dist && sha256sum codag_* install.sh install.ps1 provenance.json | sort -k2 > checksums.txt)
 
-      - name: Attest release archives
+      - name: Attest public artifacts
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: |
             dist/codag_*.tar.gz
             dist/codag_*.zip
+            dist/checksums.txt
+            dist/install.sh
+            dist/install.ps1
+            dist/provenance.json
 
-      - name: Publish public release
+      - name: Publish immutable public release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
         run: |
-          source_commit="$(git -C source rev-parse HEAD)"
+          set -euo pipefail
           gh release create "v$VERSION" \
-            dist/checksums.txt dist/codag_* dist/install.sh dist/install.ps1 \
-            --repo codag-megalith/codag-releases \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Codag v$VERSION" \
-            --notes "Compiled from private source tag v$VERSION ($source_commit)."
+            --notes "Compiled from private source tag v$VERSION ($SOURCE_SHA). See provenance.json and GitHub build attestations." \
+            --draft
+          gh release upload "v$VERSION" dist/* --repo "$GITHUB_REPOSITORY"
+          gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest
