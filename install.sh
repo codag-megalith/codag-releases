@@ -169,7 +169,7 @@ wait_for_service() {
     binary_path="$1"
     attempt=0
     while [ "$attempt" -lt 32 ]; do
-        if "$binary_path" status >/dev/null 2>&1; then
+        if "$binary_path" status --local >/dev/null 2>&1; then
             return 0
         fi
         attempt=$((attempt + 1))

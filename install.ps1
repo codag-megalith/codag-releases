@@ -84,7 +84,7 @@ try {
             schtasks.exe /Run /TN $TaskName | Out-Null
             $Healthy = $false
             for ($Attempt = 0; $Attempt -lt 32; $Attempt++) {
-                & $Installed status *>$null
+                & $Installed status --local *>$null
                 if ($LASTEXITCODE -eq 0) { $Healthy = $true; break }
                 Start-Sleep -Milliseconds 250
             }
