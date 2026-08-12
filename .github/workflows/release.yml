@@ -137,11 +137,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          release_created=0
+          cleanup_unpublished_release() {
+            if [ "$release_created" -eq 1 ]; then
+              is_draft="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)"
+              if [ "$is_draft" = "true" ]; then
+                gh release delete "v$VERSION" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+              fi
+            fi
+          }
+          trap cleanup_unpublished_release EXIT
           gh release create "v$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Codag v$VERSION" \
             --notes "Compiled from private source tag v$VERSION ($SOURCE_SHA). See provenance.json and GitHub build attestations." \
             --draft
+          release_created=1
           gh release upload "v$VERSION" dist/* --repo "$GITHUB_REPOSITORY"
           gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          release_created=0
+          trap - EXIT
