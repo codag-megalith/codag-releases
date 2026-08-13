@@ -65,30 +65,10 @@ detect_arch() {
     esac
 }
 
-github_api() {
-    url="$1"
-    if [ -n "${GITHUB_TOKEN:-}" ]; then
-        curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" "$url"
-    else
-        curl -fsSL "$url"
-    fi
-}
-
-get_latest_version() {
-    url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-    version="$(github_api "$url" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')"
-
-    if [ -z "$version" ]; then
-        error "Failed to fetch latest version from GitHub. Please check your internet connection."
-    fi
-
-    echo "$version"
-}
-
 resolve_version() {
     requested="${CODAG_VERSION:-}"
     if [ -z "$requested" ]; then
-        get_latest_version
+        printf '\n'
         return
     fi
     requested="${requested#v}"
@@ -314,16 +294,21 @@ main() {
     if [ -n "${CODAG_VERSION:-}" ]; then
         info "Using requested version..."
     else
-        info "Fetching latest version..."
+        info "Using latest public release..."
     fi
     version="$(resolve_version)"
     version="${version#v}"
-    info "Installing version: ${version}"
 
     binary_file="${BINARY}"
     archive_name="codag_${os}_${arch}.tar.gz"
-    download_url="https://github.com/${GITHUB_REPO}/releases/download/v${version}/${archive_name}"
-    checksums_url="https://github.com/${GITHUB_REPO}/releases/download/v${version}/checksums.txt"
+    if [ -n "$version" ]; then
+        info "Installing version: ${version}"
+        release_base="https://github.com/${GITHUB_REPO}/releases/download/v${version}"
+    else
+        release_base="https://github.com/${GITHUB_REPO}/releases/latest/download"
+    fi
+    download_url="${release_base}/${archive_name}"
+    checksums_url="${release_base}/checksums.txt"
 
     tmp_dir="$(mktemp -d)"
     trap 'rm -rf "$tmp_dir"' 0
@@ -404,7 +389,12 @@ main() {
         success "Codag service restarted and healthy"
     fi
     rm -f "$rollback_binary"
-    success "Codag CLI v${version} installed to ${installed_binary}"
+    installed_version="$("$installed_binary" version 2>/dev/null | awk 'NR == 1 { print $2 }')"
+    if [ -n "$installed_version" ]; then
+        success "Codag CLI v${installed_version} installed to ${installed_binary}"
+    else
+        success "Codag CLI installed to ${installed_binary}"
+    fi
 
     install_bash_completion "$installed_binary"
 

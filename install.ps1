@@ -16,31 +16,26 @@ $Architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSA
     default { Fail "Unsupported Windows architecture." }
 }
 
-$Headers = @{ Accept = "application/vnd.github+json"; "User-Agent" = "codag-installer" }
-if ($env:GITHUB_TOKEN) { $Headers.Authorization = "Bearer $($env:GITHUB_TOKEN)" }
 $RequestedVersion = if ($env:CODAG_VERSION) { $env:CODAG_VERSION.TrimStart("v") } else { "" }
 if ($RequestedVersion -and $RequestedVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
     Fail "CODAG_VERSION must be a stable semantic version such as 0.2.2."
 }
-$ReleaseEndpoint = if ($RequestedVersion) {
-    "https://api.github.com/repos/$Repo/releases/tags/v$RequestedVersion"
+$ReleaseBase = if ($RequestedVersion) {
+    "https://github.com/$Repo/releases/download/v$RequestedVersion"
 } else {
-    "https://api.github.com/repos/$Repo/releases/latest"
+    "https://github.com/$Repo/releases/latest/download"
 }
-$Release = Invoke-RestMethod -Headers $Headers -Uri $ReleaseEndpoint
-$Version = $Release.tag_name.TrimStart("v")
 $ArchiveName = "codag_windows_$Architecture.zip"
-$ArchiveAsset = $Release.assets | Where-Object { $_.name -eq $ArchiveName } | Select-Object -First 1
-$ChecksumAsset = $Release.assets | Where-Object { $_.name -eq "checksums.txt" } | Select-Object -First 1
-if (-not $ArchiveAsset -or -not $ChecksumAsset) { Fail "The release is missing Windows archive or checksum assets." }
+$ArchiveUrl = "$ReleaseBase/$ArchiveName"
+$ChecksumsUrl = "$ReleaseBase/checksums.txt"
 
 $Temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("codag-install-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $Temporary | Out-Null
 try {
     $Archive = Join-Path $Temporary $ArchiveName
     $Checksums = Join-Path $Temporary "checksums.txt"
-    Invoke-WebRequest -UseBasicParsing -Uri $ArchiveAsset.browser_download_url -OutFile $Archive
-    Invoke-WebRequest -UseBasicParsing -Uri $ChecksumAsset.browser_download_url -OutFile $Checksums
+    Invoke-WebRequest -UseBasicParsing -Uri $ArchiveUrl -OutFile $Archive
+    Invoke-WebRequest -UseBasicParsing -Uri $ChecksumsUrl -OutFile $Checksums
 
     $ExpectedLine = Get-Content $Checksums | Where-Object { $_ -match "\s$([regex]::Escape($ArchiveName))$" } | Select-Object -First 1
     if (-not $ExpectedLine) { Fail "Checksum for $ArchiveName was not found." }
@@ -107,7 +102,8 @@ try {
         throw
     }
 
-    Write-Host "Codag CLI v$Version installed to $Installed"
+    $InstalledVersion = (& $Installed version | Select-Object -First 1)
+    Write-Host "$InstalledVersion installed to $Installed"
     Write-Host "Run: $Installed setup"
 } finally {
     if (Test-Path $Temporary) { Remove-Item -Recurse -Force $Temporary }
