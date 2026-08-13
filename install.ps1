@@ -49,18 +49,21 @@ try {
     if ($Actual -ne $Expected) { Fail "Checksum verification failed." }
 
     if (Get-Command gh -ErrorAction SilentlyContinue) {
-        & gh attestation verify $Archive --repo $Repo *>$null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "Signed build provenance verified."
-        } elseif ($env:CODAG_REQUIRE_ATTESTATION -eq "1") {
-            Fail "Signed build-provenance verification failed. Authenticate GitHub CLI with 'gh auth login', then retry."
+        & gh auth status *>$null
+        if ($LASTEXITCODE -ne 0) {
+            if ($env:CODAG_REQUIRE_ATTESTATION -eq "1") {
+                Fail "GitHub CLI is not authenticated; cannot verify signed build provenance. Run 'gh auth login', then retry."
+            }
+            Write-Warning "GitHub CLI is not authenticated; skipping signed build-provenance verification. SHA256 checksum verification remains mandatory."
         } else {
-            Write-Warning "GitHub CLI could not verify signed provenance; continuing because the mandatory checksum passed. Run 'gh auth login' to enable attestation verification."
+            & gh attestation verify $Archive --repo $Repo *>$null
+            if ($LASTEXITCODE -ne 0) { Fail "Signed build-provenance verification failed; the downloaded artifact does not match the signed release." }
+            Write-Host "Signed build provenance verified."
         }
     } elseif ($env:CODAG_REQUIRE_ATTESTATION -eq "1") {
         Fail "GitHub CLI is required because CODAG_REQUIRE_ATTESTATION=1. Install gh, then retry."
     } else {
-        Write-Host "GitHub CLI not found; continuing with mandatory checksum verification."
+        Write-Warning "GitHub CLI was not found; skipping signed build-provenance verification. SHA256 checksum verification remains mandatory."
     }
 
     Expand-Archive -Path $Archive -DestinationPath $Temporary -Force

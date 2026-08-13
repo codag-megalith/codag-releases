@@ -128,10 +128,25 @@ verify_checksum() {
 
 verify_attestation() {
     file="$1"
+    require="${CODAG_REQUIRE_ATTESTATION:-0}"
     if ! command -v gh >/dev/null 2>&1; then
-        return 1
+        if [ "$require" = "1" ]; then
+            error "GitHub CLI is required because CODAG_REQUIRE_ATTESTATION=1. Install gh, then retry."
+        fi
+        warn "GitHub CLI was not found; skipping signed build-provenance verification. SHA256 checksum verification remains mandatory."
+        return 0
     fi
-    gh attestation verify "$file" --repo "$GITHUB_REPO" >/dev/null 2>&1
+    if ! gh auth status >/dev/null 2>&1; then
+        if [ "$require" = "1" ]; then
+            error "GitHub CLI is not authenticated; cannot verify signed build provenance. Run 'gh auth login', then retry."
+        fi
+        warn "GitHub CLI is not authenticated; skipping signed build-provenance verification. SHA256 checksum verification remains mandatory."
+        return 0
+    fi
+    if ! gh attestation verify "$file" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
+        error "Signed build-provenance verification failed for $(basename "$file"); the downloaded artifact does not match the signed release."
+    fi
+    success "Signed provenance verified"
 }
 
 extract_archive() {
@@ -328,20 +343,8 @@ main() {
     verify_checksum "$archive_path" "$expected_checksum"
     success "Checksum verified"
 
-    if command -v gh >/dev/null 2>&1; then
-        info "Verifying signed build provenance..."
-        if verify_attestation "$archive_path"; then
-            success "Signed provenance verified"
-        elif [ "${CODAG_REQUIRE_ATTESTATION:-0}" = "1" ]; then
-            error "Signed build-provenance verification failed. Authenticate GitHub CLI with 'gh auth login', then retry."
-        else
-            warn "GitHub CLI could not verify signed provenance; continuing because the mandatory checksum passed. Run 'gh auth login' to enable attestation verification."
-        fi
-    elif [ "${CODAG_REQUIRE_ATTESTATION:-0}" = "1" ]; then
-        error "GitHub CLI is required because CODAG_REQUIRE_ATTESTATION=1. Install gh, then retry."
-    else
-        info "GitHub CLI not found; continuing with mandatory checksum verification."
-    fi
+    info "Verifying signed build provenance when GitHub CLI is authenticated..."
+    verify_attestation "$archive_path"
 
     info "Extracting..."
     extract_archive "$archive_path" "$tmp_dir"
