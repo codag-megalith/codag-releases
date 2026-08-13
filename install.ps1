@@ -49,8 +49,14 @@ try {
     if ($Actual -ne $Expected) { Fail "Checksum verification failed." }
 
     if (Get-Command gh -ErrorAction SilentlyContinue) {
-        & gh attestation verify $Archive --repo $Repo | Out-Null
-        if ($LASTEXITCODE -ne 0) { Fail "Signed build-provenance verification failed." }
+        & gh attestation verify $Archive --repo $Repo *>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Signed build provenance verified."
+        } elseif ($env:CODAG_REQUIRE_ATTESTATION -eq "1") {
+            Fail "Signed build-provenance verification failed. Authenticate GitHub CLI with 'gh auth login', then retry."
+        } else {
+            Write-Warning "GitHub CLI could not verify signed provenance; continuing because the mandatory checksum passed. Run 'gh auth login' to enable attestation verification."
+        }
     } elseif ($env:CODAG_REQUIRE_ATTESTATION -eq "1") {
         Fail "GitHub CLI is required because CODAG_REQUIRE_ATTESTATION=1. Install gh, then retry."
     } else {
