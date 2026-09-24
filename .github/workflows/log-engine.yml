@@ -1,0 +1,185 @@
+name: Publish log engine
+run-name: Publish log engine ${{ inputs.version }} from ${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version matching the MCP Cargo.toml (without log-v)
+        required: true
+        type: string
+      source_sha:
+        description: Full tested codag source commit
+        required: true
+        type: string
+      dependency_sha:
+        description: Full codag-drain commit
+        required: true
+        default: fcdbbffac8f5b589b49ee5fe2a0e96d3209833ec
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: log-engine-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            platform: darwin_arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: darwin_amd64
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            platform: linux_amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            platform: linux_arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ inputs.version }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      DEPENDENCY_SHA: ${{ inputs.dependency_sha }}
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CODAG_BUILD_SHA: ${{ inputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: release
+          persist-credentials: false
+      - name: Validate release identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          printf '%s\n' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          printf '%s\n' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          printf '%s\n' "$DEPENDENCY_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          if gh release view "log-v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'This release already exists; increment the source version.' >&2
+            exit 1
+          fi
+      - name: Mint private-source read token
+        id: source-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CODAG_RELEASE_APP_ID }}
+          private-key: ${{ secrets.CODAG_RELEASE_APP_PRIVATE_KEY }}
+          owner: codag-megalith
+          repositories: codag
+          permission-contents: read
+      - uses: actions/checkout@v6
+        with:
+          repository: codag-megalith/codag
+          ref: ${{ inputs.source_sha }}
+          token: ${{ steps.source-token.outputs.token }}
+          path: engine
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: codag-megalith/codag-drain
+          ref: ${{ inputs.dependency_sha }}
+          path: codag-drain
+          persist-credentials: false
+      - name: Check exact inputs
+        run: |
+          test "$(git -C engine rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C codag-drain rev-parse HEAD)" = "$DEPENDENCY_SHA"
+          grep -Fx "version = \"$VERSION\"" engine/mcp/codag-log-tools/Cargo.toml
+      - name: Set up Rust and static Linux C compiler
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup target add --toolchain 1.95.0 "$TARGET"
+          if [ "$(uname -s)" = Linux ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y musl-tools
+            echo 'CC=musl-gcc' >> "$GITHUB_ENV"
+            echo 'RUSTFLAGS=-C linker=musl-gcc' >> "$GITHUB_ENV"
+          fi
+      - name: Build and test exact source
+        working-directory: engine
+        run: |
+          cargo +1.95.0 test --locked --target "$TARGET"
+          cargo +1.95.0 test --locked --target "$TARGET" --manifest-path mcp/codag-log-tools/Cargo.toml
+          cargo +1.95.0 build --release --locked --target "$TARGET" --manifest-path mcp/codag-log-tools/Cargo.toml
+          export CODAG_TEST_BINARY="$CARGO_TARGET_DIR/$TARGET/release/codag-log-mcp"
+          "$CODAG_TEST_BINARY" --version
+          python3 -m unittest discover -s tests -p test_binary_setup.py -v
+          python3 -m unittest discover -s tests -p test_mcp_protocol.py -v
+      - name: Package and exercise the piped installer
+        run: |
+          mkdir dist
+          tar -czf "dist/codag-log-mcp_${VERSION}_${PLATFORM}.tar.gz" -C "$CARGO_TARGET_DIR/$TARGET/release" codag-log-mcp
+          CODAG_TEST_BINARY="$CARGO_TARGET_DIR/$TARGET/release/codag-log-mcp" python3 release/tests/test_install.py -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ inputs.version }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      DEPENDENCY_SHA: ${{ inputs.dependency_sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: log-*
+          path: dist
+          merge-multiple: true
+      - name: Assemble provenance and checksums
+        run: |
+          test "$(find dist -name '*.tar.gz' | wc -l)" -eq 4
+          cp install-log-engine.sh dist/
+          jq -n --arg version "$VERSION" --arg source_sha "$SOURCE_SHA" --arg dependency_sha "$DEPENDENCY_SHA" --arg workflow_sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
+            '{product:"codag-log-mcp",version:$version,source_repository:"codag-megalith/codag",source_sha:$source_sha,dependency_repository:"codag-megalith/codag-drain",dependency_sha:$dependency_sha,rust_toolchain:"1.95.0",release_workflow_sha:$workflow_sha,workflow_run_id:$run}' > dist/provenance.json
+          (cd dist && sha256sum *.tar.gz install-log-engine.sh provenance.json | sort -k2 > checksums.txt)
+      - name: Attest tested artifacts
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*
+      - name: Publish immutable log release
+        run: |
+          cat > dist/notes.md <<EOF
+          Local log search for incident agents. No model API key or build tools required.
+
+          Install: curl -fsSL https://codag.ai/install.sh | sh
+          Setup: codag-log-mcp setup
+
+          Built and tested on macOS and Linux, arm64 and amd64. Linux binaries use musl.
+          Source: $SOURCE_SHA
+          Dependency: $DEPENDENCY_SHA
+          See provenance.json, checksums.txt, and the GitHub build attestations.
+          EOF
+          gh release create "log-v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Codag log engine $VERSION" --notes-file dist/notes.md --draft
+          gh release upload "log-v$VERSION" dist/*.tar.gz dist/checksums.txt dist/provenance.json dist/install-log-engine.sh --repo "$GITHUB_REPOSITORY"
+          gh release edit "log-v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+      - name: Advance the log-only installation channel
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git pull --ff-only origin main
+          printf 'log-v%s\n' "$VERSION" > log-latest.txt
+          git add log-latest.txt
+          git commit -m "Release log engine $VERSION from $SOURCE_SHA"
+          git push origin HEAD:main
